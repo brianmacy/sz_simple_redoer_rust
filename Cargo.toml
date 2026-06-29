@@ -1,0 +1,28 @@
+[package]
+name = "sz_simple_redoer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Brian Macy"]
+description = "Multithreaded Senzing redo processor (Rust port of sz_simple_redoer-v4)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "sz_simple_redoer"
+path = "src/main.rs"
+
+[dependencies]
+sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", rev = "b595ca4" }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ctrlc = { version = "3", features = ["termination"] }
+num_cpus = "1"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

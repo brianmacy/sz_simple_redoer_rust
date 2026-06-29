@@ -1,0 +1,7 @@
+target
+.git
+.github
+debugging
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
