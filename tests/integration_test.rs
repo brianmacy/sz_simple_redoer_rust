@@ -55,7 +55,11 @@ fn engine_initializes_and_counts_redo_records() {
         .expect("count_redo_records must succeed against the configured backend");
     assert!(count >= 0, "redo count must be non-negative, got {count}");
 
-    SzEnvironmentCore::destroy_global_instance().expect("environment teardown must succeed");
+    // NOTE: do NOT call destroy_global_instance() here. The Senzing engine is a
+    // process-global singleton shared across every test in this binary. Tearing
+    // it down mid-suite leaves the singleton's is_initialized flag true while the
+    // native engine is gone, so the next test's get_instance() returns a DEAD
+    // engine and its engine calls fail. Process exit reclaims the singleton.
 }
 
 /// `get_redo_record()` must return a value (possibly empty) without erroring,
@@ -76,5 +80,5 @@ fn get_redo_record_returns_without_error() {
         .get_redo_record()
         .expect("get_redo_record must succeed against the configured backend");
 
-    SzEnvironmentCore::destroy_global_instance().expect("environment teardown must succeed");
+    // See note above: the global singleton must outlive individual tests.
 }
