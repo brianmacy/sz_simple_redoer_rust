@@ -88,7 +88,7 @@ cargo build --release
 ## Docker (distroless)
 
 The runtime image is `gcr.io/distroless/cc-debian13:nonroot` (matched to the
-glibc of `senzing/senzingsdk-runtime:4.3.2`, which is Debian 13 / glibc 2.41 —
+glibc of `senzing/senzingsdk-runtime:4.3.3`, which is Debian 13 / glibc 2.41 —
 cc-debian12 fails with a `GLIBC_2.38 not found` error; see `DOCKER_NOTES.md`).
 Backends are selected at build time. At least one backend is required; the build
 errors out if both are disabled.
