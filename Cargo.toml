@@ -12,7 +12,7 @@ name = "sz_simple_redoer"
 path = "src/main.rs"
 
 [dependencies]
-sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", rev = "b595ca4" }
+sz-rust-sdk = { git = "https://github.com/brianmacy/sz-rust-sdk", tag = "v4.3.1" }
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 tracing = "0.1"

@@ -11,8 +11,10 @@
 //! * `--info` -> only gates whether the response JSON is PRINTED. The engine
 //!   always routes through the WithInfo helper regardless, so `--info` has no
 //!   effect on engine-side processing (see `SZ_WITH_INFO_BITS`).
-//! * `SzBadInputError` / `SzRetryTimeoutExceededError` -> log and drop the
-//!   record (redo records are engine-internal; there is no queue to reject to).
+//! * Bad-input and retry-timeout errors -> log and drop the record (redo
+//!   records are engine-internal; there is no queue to reject to). Classified
+//!   via the sz-rust-sdk structured `ErrorCategory` hierarchy, NOT by matching
+//!   on error message strings (see `is_reject_error`).
 //! * Periodic `get_stats()` every `LONG_RECORD / 2` seconds.
 //! * Pause `SENZING_REDO_SLEEP_TIME_IN_SECONDS` when no records are available.
 //! * Graceful shutdown on SIGINT and SIGTERM; final stats printed on exit.
@@ -57,7 +59,7 @@ const INSTANCE_NAME: &str = "sz_simple_redoer";
 /// uninterruptible, so a worker wedged inside one cannot be cancelled; bounding
 /// the join keeps shutdown within a container's SIGTERM grace instead of
 /// hanging indefinitely. The tradeoff: if a worker is still stuck past this
-/// window we SKIP `destroy_global_instance()` and let the OS reclaim native
+/// window we SKIP the environment `destroy()` and let the OS reclaim native
 /// state on exit (a one-time leak-on-exit) rather than risk calling into native
 /// state a stuck worker is still using.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
@@ -135,6 +137,34 @@ fn redo_flags(info: bool) -> Option<SzFlags> {
     } else {
         None
     }
+}
+
+/// Classify a `process_redo_record` error into "reject-and-continue" vs "fatal".
+///
+/// Redo records are engine-internal — there is no upstream queue to reject to —
+/// so a "reject" means *log and drop this record, keep processing*. Everything
+/// else is fatal: the process tears down (non-zero exit) rather than silently
+/// losing redo work while limping along (FIX 1).
+///
+/// Classification goes through the sz-rust-sdk **structured `ErrorCategory`
+/// hierarchy** (`SzError::is`), never a `to_string().contains("SENZ…")` string
+/// match. Reject covers:
+///   * `ErrorCategory::BadInput` — and its subtypes `NotFound` /
+///     `UnknownDataSource`: the record itself is unprocessable, so dropping it
+///     is correct.
+///   * `ErrorCategory::RetryTimeoutExceeded` — the engine exhausted its internal
+///     retry budget for a transient condition. This is RETRYABLE, hence dropped
+///     (not fatal). The stale `b595ca4` SDK bucketed SENZ0010 coarsely so it did
+///     not surface as `RetryTimeoutExceeded` and fell through to the fatal arm;
+///     v4.3.1's generated `getLastExceptionCode` → `ErrorCategory` map classifies
+///     code 10 as `RetryTimeoutExceeded` (→ `Retryable`).
+///
+/// The broader retryable categories (`DatabaseConnectionLost` /
+/// `DatabaseTransient`) are deliberately NOT dropped: a mid-run database drop
+/// should tear the process down, not silently discard redo records. Only the
+/// engine-internal retry-budget timeout is treated as reject.
+fn is_reject_error(e: &SzError) -> bool {
+    e.is(ErrorCategory::BadInput) || e.is(ErrorCategory::RetryTimeoutExceeded)
 }
 
 /// Build a human-readable log id for a redo record, matching the Python
@@ -242,17 +272,22 @@ fn main() -> anyhow::Result<()> {
 
     let (workers_clean, result) = run(environment.clone(), &args, n_workers);
 
-    // Teardown (FIX 3): only destroy the global Senzing environment if EVERY
-    // worker finished within the shutdown grace window. The sz-rust-sdk has no
-    // SenzingGuard type; destroy_global_instance() is the documented teardown
-    // path, but it calls Sz_destroy() into native state. If a worker is still
-    // stuck inside an uninterruptible process_redo_record (workers_clean ==
-    // false), tearing down here would risk a use-after-free in that still-live
-    // call. In that case we deliberately SKIP teardown and let process exit
-    // reclaim the resources (a one-time leak-on-exit — acceptable, and far
-    // safer than calling into freed native state).
+    // Teardown (FIX 3): only destroy the Senzing environment if EVERY worker
+    // finished within the shutdown grace window. v4.3.1 replaced the static
+    // `destroy_global_instance()` with the ownership-based `Arc::destroy(self)`:
+    // it removes the global singleton reference, then requires SOLE ownership
+    // (`Arc::try_unwrap`) before calling `Sz_destroy()` into native state. That
+    // is exactly the invariant FIX 3 wants — a still-running worker holds a
+    // clone of this `Arc`, so `destroy()` cannot tear down native state out from
+    // under it (it would return an error instead of risking a use-after-free).
+    // We still gate on `workers_clean` so that on a stuck-worker shutdown we skip
+    // the call entirely (no clone left to fight over) and let process exit
+    // reclaim the resources — a one-time leak-on-exit, acceptable and safe.
+    // (The SDK's RAII `SenzingGuard` wraps this same `destroy()`; we call it
+    // explicitly here because the teardown decision is conditional on
+    // `workers_clean`, which a drop-guard cannot express.)
     if workers_clean {
-        if let Err(e) = SzEnvironmentCore::destroy_global_instance() {
+        if let Err(e) = environment.destroy() {
             warn!("Error during Senzing environment teardown: {e}");
         }
     } else {
@@ -570,7 +605,7 @@ fn run_monitor(
     let long_threshold = Duration::from_secs(long_record);
     let mut num_stuck = 0usize;
     if let Ok(map) = in_flight.lock() {
-        for (_id, (started, record)) in map.iter() {
+        for (started, record) in map.values() {
             let duration = started.elapsed();
             if duration > long_threshold {
                 let mins = duration.as_secs_f64() / 60.0;
@@ -588,8 +623,9 @@ fn run_monitor(
 
 /// Worker: receive redo records and process them with the engine.
 ///
-/// `SzError::BadInput` and `SzError::RetryTimeoutExceeded` are logged and the
-/// record is dropped (no queue to reject to); all other errors are counted.
+/// Errors classified as reject by `is_reject_error` (bad-input family +
+/// retry-timeout, via the structured `ErrorCategory` hierarchy) are logged and
+/// the record is dropped (no queue to reject to); all other errors are fatal.
 fn worker_loop(
     thread_id: usize,
     rx: Arc<Mutex<mpsc::Receiver<Job>>>,
@@ -660,11 +696,16 @@ fn worker_loop(
                     print_throughput_stats(count, start_time, &in_flight, max_workers);
                 }
             }
-            Err(SzError::BadInput { .. }) | Err(SzError::RetryTimeoutExceeded { .. }) => {
-                // Redo records are engine-internal; there is no queue to reject
-                // to, so log and drop (matches the Python behavior).
+            Err(e) if is_reject_error(&e) => {
+                // Bad-input family or retry-timeout: redo records are
+                // engine-internal, so there is no queue to reject to — log and
+                // drop, then keep processing (matches the Python behavior).
+                // Retry-timeout (SENZ0010 -> RetryTimeoutExceeded) is RETRYABLE,
+                // never fatal; classification is via the structured
+                // `ErrorCategory` hierarchy (see `is_reject_error`).
                 warn!(
-                    "FAILED due to bad data or timeout [worker {thread_id}]: {}",
+                    "REJECTED redo record ({}) [worker {thread_id}]: {}",
+                    e.category(),
                     logging_id(&record)
                 );
             }
@@ -751,5 +792,50 @@ mod tests {
             Some(SzFlags::from_bits_retain(SZ_WITH_INFO_BITS))
         );
         assert_eq!(redo_flags(false), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Error classification (is_reject_error).
+    //
+    // Regression guard for the b595ca4 -> v4.3.1 bump: retry-timeout
+    // (SENZ0010 -> RetryTimeoutExceeded) MUST classify as reject-and-continue,
+    // NOT fatal. The stale SDK bucketed it coarsely so it slipped into the
+    // fatal arm; v4.3.1's structured ErrorCategory hierarchy classifies it
+    // correctly. Classification is category-based, never string-based.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn retry_timeout_is_reject_not_fatal() {
+        // The core regression: SENZ0010 / retry-timeout must be retryable.
+        let e = SzError::retry_timeout_exceeded("SENZ0010: retry timeout exceeded");
+        assert!(e.is(ErrorCategory::RetryTimeoutExceeded));
+        assert!(e.is(ErrorCategory::Retryable));
+        assert!(
+            is_reject_error(&e),
+            "retry-timeout must be reject, not fatal"
+        );
+    }
+
+    #[test]
+    fn bad_input_family_is_reject() {
+        assert!(is_reject_error(&SzError::bad_input("malformed record")));
+        assert!(is_reject_error(&SzError::not_found("no such entity")));
+        assert!(is_reject_error(&SzError::unknown_data_source(
+            "DSRC not registered"
+        )));
+    }
+
+    #[test]
+    fn unrecoverable_and_database_errors_are_fatal() {
+        // These must tear the process down, not be silently dropped.
+        assert!(!is_reject_error(&SzError::database("permanent DB failure")));
+        assert!(!is_reject_error(&SzError::database_connection_lost(
+            "conn dropped"
+        )));
+        assert!(!is_reject_error(&SzError::database_transient("deadlock")));
+        assert!(!is_reject_error(&SzError::not_initialized("engine gone")));
+        assert!(!is_reject_error(&SzError::license("license expired")));
+        assert!(!is_reject_error(&SzError::configuration("bad config")));
+        assert!(!is_reject_error(&SzError::unrecoverable("broken state")));
     }
 }
