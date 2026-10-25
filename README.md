@@ -1,3 +1,8 @@
+> **⚠️ ARCHIVED — replaced by [`sz_queue_combined_consumer`](https://github.com/brianmacy/sz_queue_combined_consumer).**
+> That repository provides the redo role (get_redo_record → process_redo_record) in a single worker pool with one `SENZING_REDO_PERCENT` knob
+> (`--redo-percent 0` = pure loader, `100` = pure redoer), and adds SQS and ActiveMQ binaries and file mode.
+> This repository is read-only and no longer maintained.
+
 # sz_simple_redoer (Rust)
 
 A multithreaded Senzing redo processor written in Rust. This is the Rust sibling
